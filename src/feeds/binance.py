@@ -1,3 +1,8 @@
+"""
+Author: Benjamin Noirat 
+Date: 2026-04-02
+"""
+
 import asyncio
 import json
 import websockets

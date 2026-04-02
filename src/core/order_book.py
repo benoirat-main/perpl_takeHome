@@ -1,3 +1,8 @@
+"""
+Author: Benjamin Noirat 
+Date: 2026-04-02
+"""
+
 from collections import defaultdict
 from bisect import bisect_left, bisect_right
 from core.constants import EPSILON

@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.pyc
+mainTest.py
 
 # Virtual env
 venv/

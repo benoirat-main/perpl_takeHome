@@ -1,4 +1,9 @@
 
+"""
+Author: Benjamin Noirat 
+Date: 2026-04-02
+"""
+
 class StratBen:
     def __init__(self, feeds):
         # subscribe to all feeds

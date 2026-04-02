@@ -1,3 +1,8 @@
+"""
+Author: Benjamin Noirat 
+Date: 2026-04-02
+"""
+
 import asyncio
 import json
 import websockets
@@ -7,9 +12,6 @@ from core.order_book import FeedOrderBook
 
 class CoinbaseFeed:
     def __init__(self, symbol: str):
-        """
-        symbol: e.g., "BTC-USD"
-        """
         self.symbol = symbol.upper()
         self.book_name = "coinbase"
         self.book = FeedOrderBook(self.book_name)
@@ -19,21 +21,13 @@ class CoinbaseFeed:
         self._book_listeners = []
         self._trade_listeners = []
 
-        # Reconnect/backoff params
-        self._reconnect_delay = 1  # initial delay in seconds
+        self._reconnect_delay_seconds = 1
         self._max_reconnect_delay = 60
 
-    # --- Subscription methods ---
     def subscribe_book(self, callback):
-        """
-        callback signature: async def callback(feed_name: str, book: FeedOrderBook)
-        """
         self._book_listeners.append(callback)
 
     def subscribe_trade(self, callback):
-        """
-        callback signature: async def callback(feed_name: str, trade: BookLevel)
-        """
         self._trade_listeners.append(callback)
 
     async def _notify_book(self):
@@ -44,20 +38,20 @@ class CoinbaseFeed:
         for cb in self._trade_listeners:
             await cb(self.book_name, trade)
 
-    # --- Websocket connection ---
     async def connect(self):
         while True:
             try:
                 async with websockets.connect(self.ws_url, max_size=None) as ws:
                     await self._subscribe(ws)
-                    self._reconnect_delay = 1  # reset delay after successful connect
+                    self._reconnect_delay_seconds = 1
                     await self._listen(ws)
             except Exception as e:
-                print(f"[CoinbaseFeed] Connection error: {e}. Reconnecting in {self._reconnect_delay}s...")
-                await asyncio.sleep(self._reconnect_delay)
-                self._reconnect_delay = min(self._reconnect_delay * 2, self._max_reconnect_delay)
+                print(f"[CoinbaseFeed] Connection error: {e}. Reconnecting in {self._reconnect_delay_seconds}s...")
+                await asyncio.sleep(self._reconnect_delay_seconds)
+                self._reconnect_delay_seconds = min(self._reconnect_delay_seconds * 2, self._reconnect_delay_seconds)
 
     async def _subscribe(self, ws):
+        # here I have to subscribe to level2_batch which 50ms batchees, as the live tick by tick version requires authentication
         msg = {
             "type": "subscribe",
             "product_ids": [self.symbol],
@@ -72,7 +66,6 @@ class CoinbaseFeed:
             msg_type = data.get("type")
 
             if msg_type == "l2update":
-                # Order book updates
                 for change in data.get("changes", []):
                     side_str, price_str, size_str = change
                     price = float(price_str)
@@ -81,7 +74,6 @@ class CoinbaseFeed:
                 await self._notify_book()
 
             elif msg_type == "match":
-                # Trade updates
                 price = float(data['price'])
                 size = float(data['size'])
                 if size > EPSILON:
