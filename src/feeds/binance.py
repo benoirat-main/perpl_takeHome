@@ -11,46 +11,20 @@ import websockets
 
 from core.constants import EPSILON
 from core.types import BookLevel
-from core.order_book import FeedOrderBook, TOP_N
+from core.order_book import TOP_N
+from feeds.feedbase import FeedBase
 
 
-class BinanceFeed:
-    def __init__(self, symbol: str):
-        self.symbol = symbol.lower()
-        self.book_name = "binance"
-        self.book = FeedOrderBook(self.book_name)
-
-        # Listeners
-        self._book_listeners = []
-        self._trade_listeners = []
-
-        # Async queue for full book updates
-        self._full_book_queue = asyncio.Queue()
-        asyncio.create_task(self._process_full_book_queue())
-
-        # Reconnect params
-        self._reconnect_delay_seconds = 1
-        self._max_reconnect_delay = 60
+class BinanceFeed(FeedBase):
+    def __init__(self, params):
+        self.params = params
+        self.params['feed_name'] = "binance"
+        super().__init__(self.params)
+        self.symbol = self.params['symbol'].lower()
 
         # Stream URLs
         self._depth_url = f"wss://stream.binance.com:9443/ws/{self.symbol}@depth@100ms"
         self._trade_url = f"wss://stream.binance.com:9443/ws/{self.symbol}@trade"
-
-    # ----------------- Subscription API -----------------
-    def subscribe_book(self, callback):
-        self._book_listeners.append(callback)
-
-    def subscribe_trade(self, callback):
-        self._trade_listeners.append(callback)
-
-    # ----------------- Internal Notifiers -----------------
-    async def _notify_book(self):
-        for cb in self._book_listeners:
-            await cb(self.book_name, self.book)
-
-    async def _notify_trade(self, trade: BookLevel):
-        for cb in self._trade_listeners:
-            await cb(self.book_name, trade)
 
     # ----------------- WebSocket Connection -----------------
     async def connect(self):
@@ -75,12 +49,16 @@ class BinanceFeed:
                 async with websockets.connect(self._trade_url) as ws:
                     async for msg in ws:
                         data = json.loads(msg)
-                        price = float(data['p'])
-                        size = float(data['q'])
-                        side = 'bid' if data['m'] is False else 'ask'  # 'm' = maker side (True if sell)
-                        if size > EPSILON:
-                            trade = BookLevel(price=price, size=size, exchange=self.book_name)
-                            await self._notify_trade(trade)
+                        if self.last_trade_time <= data['E']: # milliseconds since epoch
+                            self.last_trade_time = data['E']
+                            price = float(data['p'])
+                            size = float(data['q'])
+                            side = 'bid' if data['m'] is False else 'ask'  # 'm' = maker side (True if sell)
+                            if size > EPSILON:
+                                trade = BookLevel(price=price, size=size, exchange=self.book_name)
+                                await self._notify_trade(trade)
+                        else:
+                            print(f"[{self.params['feed_name']}] Warning: received out-of-order trade update (timestamp {data['E']} < last {self.last_trade_time}). Ignoring.")
             except Exception as e:
                 print(f"[BinanceFeed] Trade connection error: {e}. Reconnecting in {self._reconnect_delay_seconds}s...")
                 await asyncio.sleep(self._reconnect_delay_seconds)
@@ -90,14 +68,17 @@ class BinanceFeed:
     async def _listen_depth(self, ws):
         async for msg in ws:
             data = json.loads(msg)
-            # Binance depth updates: 'b' (bids), 'a' (asks)
-            changes = []
-            for price_str, qty_str in data.get('b', []):
-                changes.append(('buy', price_str, qty_str))
-            for price_str, qty_str in data.get('a', []):
-                changes.append(('sell', price_str, qty_str))
+            if self.last_update_time <= data['E']: # milliseconds since epoch
+                self.last_update_time = data['E']
+                changes = []
+                for price_str, qty_str in data.get('b', []):
+                    changes.append(('buy', price_str, qty_str))
+                for price_str, qty_str in data.get('a', []):
+                    changes.append(('sell', price_str, qty_str))
 
-            await self._process_l2update_fast(changes)
+                await self._process_l2update_fast(changes)
+            else:
+                print(f"[{self.params['feed_name']}] Warning: received out-of-order depth update (timestamp {data['E']} < last {self.last_update_time}). Ignoring.")
 
     # ----------------- Fast-Path Top-N -----------------
     async def _process_l2update_fast(self, changes):
@@ -127,10 +108,3 @@ class BinanceFeed:
             size = float(size_str)
             side = 'bid' if side_str == 'buy' else 'ask'
             self._full_book_queue.put_nowait((side, price, size))
-
-    # ----------------- Async Full Book Maintenance -----------------
-    async def _process_full_book_queue(self):
-        while True:
-            side, price, size = await self._full_book_queue.get()
-            self.book.update_level(side, price, size, self.book_name)
-            self._full_book_queue.task_done()

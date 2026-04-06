@@ -11,58 +11,30 @@ import websockets
 
 from core.constants import EPSILON
 from core.types import BookLevel
-from core.order_book import FeedOrderBook, TOP_N
+from core.order_book import TOP_N
+from feeds.feedbase import FeedBase
+from datetime import datetime
 
-
-class CoinbaseFeed:
-    def __init__(self, symbol: str):
-        self.symbol = symbol.upper()
-        self.book_name = "coinbase"
-        self.book = FeedOrderBook(self.book_name)
+class CoinbaseFeed(FeedBase):
+    def __init__(self, params):
+        self.params = params
+        self.params['feed_name'] = "coinbase"
+        super().__init__(self.params)
+        self.symbol = self.params['symbol'].upper()
         self.ws_url = "wss://ws-feed.exchange.coinbase.com"
-
-        # Listeners
-        self._book_listeners = []
-        self._trade_listeners = []
-
-        # Async queue for full book updates
-        self._full_book_queue = asyncio.Queue()
-
-        # Background task to process full book asynchronously
-        asyncio.create_task(self._process_full_book_queue())
-
-        # Reconnect params
-        self._reconnect_delay_seconds = 1
-        self._max_reconnect_delay = 60
-
-    # ----------------- Subscription API -----------------
-    def subscribe_book(self, callback):
-        self._book_listeners.append(callback)
-
-    def subscribe_trade(self, callback):
-        self._trade_listeners.append(callback)
-
-    # ----------------- Internal Notifiers -----------------
-    async def _notify_book(self):
-        for cb in self._book_listeners:
-            await cb(self.book_name, self.book)
-
-    async def _notify_trade(self, trade: BookLevel):
-        for cb in self._trade_listeners:
-            await cb(self.book_name, trade)
 
     # ----------------- WebSocket Connection -----------------
     async def connect(self):
         while True:
-            try:
+            # try:
                 async with websockets.connect(self.ws_url, max_size=None) as ws:
                     await self._subscribe(ws)
                     self._reconnect_delay_seconds = 1
                     await self._listen(ws)
-            except Exception as e:
-                print(f"[CoinbaseFeed] Connection error: {e}. Reconnecting in {self._reconnect_delay_seconds}s...")
-                await asyncio.sleep(self._reconnect_delay_seconds)
-                self._reconnect_delay_seconds = min(self._reconnect_delay_seconds * 2, self._max_reconnect_delay)
+            # except Exception as e:
+            #     print(f"[CoinbaseFeed] Connection error: {e}. Reconnecting in {self._reconnect_delay_seconds}s...")
+            #     await asyncio.sleep(self._reconnect_delay_seconds)
+            #     self._reconnect_delay_seconds = min(self._reconnect_delay_seconds * 2, self._max_reconnect_delay)
 
     async def _subscribe(self, ws):
         msg = {
@@ -89,15 +61,28 @@ class CoinbaseFeed:
                 await self._notify_book()
 
             elif msg_type == "l2update":
-                changes = data.get("changes", [])
-                await self._process_l2update_fast(changes)
+                dt_str = data.get("time")
+                dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00")).timestamp() * 1000 # Convert to milliseconds since epoch
+                if dt >= self.last_update_time:
+                    self.last_update_time = dt
+                    changes = data.get("changes", [])
+                    await self._process_l2update_fast(changes)
+                else:
+                    print(f"[{self.params['feed_name']}] Warning: received out-of-order l2 update (timestamp {dt} < last {self.last_update_time}). Ignoring.")
 
             elif msg_type == "match":
-                price = float(data['price'])
-                size = float(data['size'])
-                if size > EPSILON:
-                    trade = BookLevel(price=price, size=size, exchange=self.book_name)
-                    await self._notify_trade(trade)
+                dt_str = data.get("time")
+                dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00")).timestamp() * 1000 # Convert to milliseconds since epoch
+                if dt >= self.last_trade_time:
+                    self.last_trade_time = dt                  
+                    price = float(data['price'])
+                    size = float(data['size'])
+                    if size > EPSILON:
+                        trade = BookLevel(price=price, size=size, exchange=self.book_name)
+                        await self._notify_trade(trade)
+                else:
+                    print(f"[{self.params['feed_name']}] Warning: received out-of-order trade update (timestamp {dt} < last {self.last_trade_time}). Ignoring.")
+
 
     # ----------------- Fast-Path Top-N -----------------
     async def _process_l2update_fast(self, changes):
@@ -115,7 +100,10 @@ class CoinbaseFeed:
             if price in top_prices or len(top_prices) < TOP_N or \
                (side == 'bid' and price > min(top_prices)) or \
                (side == 'ask' and price < max(top_prices)):
+                old_top = self.book.get_top(side).copy()
                 self.book.update_level(side, price, size, self.book_name)
+                if self.book.get_top(side) != old_top:
+                    top_updated = True
 
         # Notify strategy immediately after top-N update
         if top_updated:
@@ -128,12 +116,3 @@ class CoinbaseFeed:
             side = 'bid' if side_str == 'buy' else 'ask'
             # Push all changes to the queue for background processing
             self._full_book_queue.put_nowait((side, price, size))
-
-    # ----------------- Async Full Book Maintenance -----------------
-    async def _process_full_book_queue(self):
-        """Background task to maintain full book (already updated in top-N)"""
-        while True:
-            side, price, size = await self._full_book_queue.get()
-            # Update the full book (skip top-N fast path if you want)
-            self.book.update_level(side, price, size, self.book_name)
-            self._full_book_queue.task_done()
