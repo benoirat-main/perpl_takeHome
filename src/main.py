@@ -8,6 +8,7 @@ from feeds.binance import BinanceFeed
 from feeds.coinbase import CoinbaseFeed
 from strategy.strat_ben import StratBen
 from collections import defaultdict
+from core import order_book
 import monitor.cli_monitor
 
 async def main():
@@ -20,17 +21,38 @@ async def main():
         'use_cli_monitor' : True
     }
     params['debug'] = True
+    params['symbol'] = 'BTCUSD'
+    # the following are given in price, it could also be in % of mid price etc
+    params['fair_value'] = {
+        'uncross_consolidated_book' : False, # whether to filter out crossed levels in the consolidated book before calculating fair value. This looses a lot if info when exchanges are far apart
+        'top_n'                     : 20, # how many levels to consideer for the fair value calculation, limited by the size of fast path order_book
+    }
+    params['quotes'] = {
+        'spread_fixed'   : 0.02, # price offset to the fair value to produce our quotes
+        'spread_vola'    : 0.0, # TODO: extra spread based on trailing volatility
+        'spread_max_pos' : 1.1, # max extra spread based on position, in price
+        'size'           : 0.1 # size of our quotes
+    }
+    params['risk_limits'] = {
+        'max_position'        : 10.0, # max position in the asset, in size
+        'max_position_global' : 1000000 # max global position in USD across all assets
+    }
 
-    binance_feed = BinanceFeed({"symbol": "BTCUSDT"})
-    coinbase_feed = CoinbaseFeed({"symbol": "BTC-USD"})
+    # Config Sanity checks
+    if params['fair_value']['top_n'] > order_book.TOP_N:
+        raise ValueError("top_n must be less than or equal to the order book TOP_N for the feeds")
+
+    # For now we limit 1 instrument per feed, in live we would obviously want more.
+    binance_feed = BinanceFeed({"symbol": params['symbol']})
+    coinbase_feed = CoinbaseFeed({"symbol": params['symbol']})
     params['feeds'] = [binance_feed, coinbase_feed]
 
     # Instantiate strategy and subscribe to feeds
-    strat_1 = StratBen(params)
+    strat = StratBen(params)
 
     if params['prints']['use_cli_monitor']:
         await asyncio.gather(
-            monitor.cli_monitor.run_cli(params['feeds']),
+            monitor.cli_monitor.run_cli(params['feeds'], strat),
             *(feed.connect() for feed in params['feeds'])
         )
     else:

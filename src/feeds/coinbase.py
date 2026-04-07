@@ -9,7 +9,7 @@ import asyncio
 import json
 import websockets
 
-from core.constants import EPSILON
+from core.constants import EPSILON, CONTRACT_SPECS
 from core.types import BookLevel
 from core.order_book import TOP_N
 from feeds.feedbase import FeedBase
@@ -17,10 +17,9 @@ from datetime import datetime
 
 class CoinbaseFeed(FeedBase):
     def __init__(self, params):
-        self.params = params
-        self.params['feed_name'] = "coinbase"
-        super().__init__(self.params)
-        self.symbol = self.params['symbol'].upper()
+        super().__init__(params)
+        self.feed_name = "coinbase"
+        self.symbol = CONTRACT_SPECS[self.params['symbol']][self.feed_name]["symbol"].upper()
         self.ws_url = "wss://ws-feed.exchange.coinbase.com"
 
     # ----------------- WebSocket Connection -----------------
@@ -56,7 +55,7 @@ class CoinbaseFeed(FeedBase):
                     for price_str, size_str in data[side]:
                         price = float(price_str)
                         size = float(size_str)
-                        self.book.update_level(side[:-1], price, size, self.book_name)
+                        self.book.update_level(side[:-1], price, size, self.feed_name)
                 # Notify top-N fast path
                 await self._notify_book()
 
@@ -68,7 +67,7 @@ class CoinbaseFeed(FeedBase):
                     changes = data.get("changes", [])
                     await self._process_l2update_fast(changes)
                 else:
-                    print(f"[{self.params['feed_name']}] Warning: received out-of-order l2 update (timestamp {dt} < last {self.last_update_time}). Ignoring.")
+                    print(f"[{self.feed_name}] Warning: received out-of-order l2 update (timestamp {dt} < last {self.last_update_time}). Ignoring.")
 
             elif msg_type == "match":
                 dt_str = data.get("time")
@@ -78,10 +77,10 @@ class CoinbaseFeed(FeedBase):
                     price = float(data['price'])
                     size = float(data['size'])
                     if size > EPSILON:
-                        trade = BookLevel(price=price, size=size, exchange=self.book_name)
+                        trade = BookLevel(price=price, size=size, exchange=self.feed_name)
                         await self._notify_trade(trade)
                 else:
-                    print(f"[{self.params['feed_name']}] Warning: received out-of-order trade update (timestamp {dt} < last {self.last_trade_time}). Ignoring.")
+                    print(f"[{self.feed_name}] Warning: received out-of-order trade update (timestamp {dt} < last {self.last_trade_time}). Ignoring.")
 
 
     # ----------------- Fast-Path Top-N -----------------
@@ -101,9 +100,15 @@ class CoinbaseFeed(FeedBase):
                (side == 'bid' and price > min(top_prices)) or \
                (side == 'ask' and price < max(top_prices)):
                 old_top = self.book.get_top(side).copy()
-                self.book.update_level(side, price, size, self.book_name)
+                self.book.update_level(side, price, size, self.feed_name)
                 if self.book.get_top(side) != old_top:
                     top_updated = True
+
+        # sanity checks
+        iscrossed = self.book.bids_top_prices[0] >= self.book.asks_top_prices[0] if self.book.bids_top_prices and self.book.asks_top_prices else False
+        if iscrossed:
+            print(f"[{self.feed_name}] Error: book is crossed after top-N update. Best bid {max(self.book.get_top('bid'))}, best ask {min(self.book.get_top('ask'))}.")
+            raise RuntimeError("Crossed internal book")
 
         # Notify strategy immediately after top-N update
         if top_updated:

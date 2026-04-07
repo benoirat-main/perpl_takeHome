@@ -9,12 +9,11 @@ from collections import defaultdict
 from core.constants import EPSILON
 from core.types import BookLevel
 
-TOP_N = 10  # Number of top levels for fast-path
+TOP_N = 20  # Number of top levels for fast-path
 
 class FeedOrderBook:
     def __init__(self, params):
         self.params = params
-        self.feed_name = params['feed_name']
 
         # Full book (dict of dicts: price  -> BookLevel)
         self.bids = defaultdict(dict)
