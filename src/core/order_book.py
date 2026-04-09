@@ -15,19 +15,19 @@ class FeedOrderBook:
     def __init__(self, params):
         self.params = params
 
-        # Full book (dict of dicts: price  -> BookLevel)
+        # Full book needed to keep precise state, but not optimized for fast updates, kept out of  fast path
         self.bids = defaultdict(dict)
         self.asks = defaultdict(dict)
 
-        # Top-N prices for fast access
-        self.bids_top_prices = []
-        self.asks_top_prices = []
+        # Top-N prices for fast processing in the fast path
+        self.bids_top_prices: list[float] = []
+        self.asks_top_prices: list[float] = []
 
-        self.bids_top = {}  # price -> BookLevel
-        self.asks_top = {}  # price -> BookLevel
+        self.bids_top: dict[float, BookLevel] = {}
+        self.asks_top: dict[float, BookLevel] = {}
 
     # ----------------- Update a single level -----------------
-    def update_level(self, side: str, price: float, size: float, exchange: str):
+    def update_level(self, side: str, price: float, size: float, exchange: str, dt: float):
         book = self.bids if side == 'bid' else self.asks
         top_dict = self.bids_top if side == 'bid' else self.asks_top
         top_prices = self.bids_top_prices if side == 'bid' else self.asks_top_prices
@@ -35,7 +35,7 @@ class FeedOrderBook:
 
         # --- Update full book dict ---
         if size > EPSILON:
-            book['price'] = BookLevel(price, size, exchange)
+            book['price'] = BookLevel(side, price, size, exchange, dt)
         else:
             if price in book:
                 del book[price]
@@ -46,7 +46,8 @@ class FeedOrderBook:
         if price in top_dict:
             # Already in top-N
             if size > EPSILON:
-                top_dict[price] = BookLevel(price, size, exchange)
+                if top_dict[price].size != size: # if size didn't change, we keep the original timestamp
+                    top_dict[price] = BookLevel(side, price, size, exchange, dt)
             else:
                 del top_dict[price]
                 top_prices.remove(price)
@@ -55,7 +56,7 @@ class FeedOrderBook:
             if size > EPSILON:
                 if len(top_prices) < TOP_N:
                     # Add directly
-                    top_dict[price] = BookLevel(price, size, exchange)
+                    top_dict[price] = BookLevel(side, price, size, exchange, dt)
                     top_prices.append(price)
                     self._sort_top_prices(side)
                 else:
@@ -66,7 +67,7 @@ class FeedOrderBook:
                         top_prices.pop(-1)
                         del top_dict[worst_price]
                         # Insert new
-                        top_dict[price] = BookLevel(price, size, exchange)
+                        top_dict[price] = BookLevel(side, price, size, exchange, dt)
                         top_prices.append(price)
                         self._sort_top_prices(side)
         # Sanity check, could be removed from the fast path once we are happy with it
@@ -81,33 +82,33 @@ class FeedOrderBook:
         top_prices.sort(reverse=(side == 'bid'))  # bids descending, asks ascending
 
     # ----------------- Top-N retrieval -----------------
-    def get_top(self, side: str):
+    def get_top(self, side: str) -> dict[float, BookLevel]:
         return self.bids_top if side == 'bid' else self.asks_top
     
     # ----------------- Best bid/ask -----------------
-    def get_best_bid(self):
+    def get_best_bid(self) -> BookLevel | None:
         if not self.bids_top_prices:
             return None
         price = self.bids_top_prices[0]
-        size = self.bids_top[price].size
-        return price, size
-
-    def get_best_ask(self):
+        lvl = self.bids_top[price]
+        return lvl
+    
+    def get_best_ask(self) -> BookLevel | None:
         if not self.asks_top_prices:
             return None
         price = self.asks_top_prices[0]
-        size = self.asks_top[price].size
-        return price, size
+        lvl = self.asks_top[price]
+        return lvl
 
-    def get_mid(self):
+    def get_mid(self) -> float | None:
         bid = self.get_best_bid()
         ask = self.get_best_ask()
         if bid and ask:
-            return (bid[0] + ask[0]) / 2
+            return (bid.price + ask.price) / 2
         return None
 
     # ----------------- Book retrieval -----------------
-    def get_full_book(self):
+    def get_full_book(self) -> dict[str, dict[float, BookLevel]]:
         # slower but I don't expect it to be called in the fast path
         return {
             'bids': {price: lvl.copy() for price, lvl in self.bids.items()},
@@ -115,13 +116,5 @@ class FeedOrderBook:
         }
     
     def get_top_book(self):
-
+        # TODO: not neeeded in this assignment
         return []
-        # top_book = {'bids': {}, 'asks': {}}
-        # for idx, price in enumerate(self.bids_top_prices):
-        #     top_book['bids'][idx] = self.bids_top[price]
-
-        # return {    
-        #     'bids': {price: lvl.copy() for price, lvl in self.bids_top.items()},
-        #     'asks': {price: lvl.copy() for price, lvl in self.asks_top.items()}
-        # }

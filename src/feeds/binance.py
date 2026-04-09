@@ -7,10 +7,12 @@ Binance feed with top-N fast-path, async full-book, and trade notifications
 
 import asyncio
 import json
+import pdb
+import sys
 import websockets
 
 from core.constants import EPSILON, CONTRACT_SPECS
-from core.types import BookLevel
+from core.types import Trade
 from core.order_book import TOP_N
 from feeds.feedbase import FeedBase
 
@@ -34,57 +36,81 @@ class BinanceFeed(FeedBase):
 
     async def _connect_depth(self):
         while True:
-            # try:
+            try:
                 async with websockets.connect(self._depth_url, max_size=None) as ws:
+                    self.connected = True
                     await self._listen_depth(ws)
-            # except Exception as e:
-            #     print(f"[BinanceFeed] Depth connection error: {e}. Reconnecting in {self._reconnect_delay_seconds}s...")
-            #     await asyncio.sleep(self._reconnect_delay_seconds)
-            #     self._reconnect_delay_seconds = min(self._reconnect_delay_seconds * 2, self._max_reconnect_delay)
+            except Exception as e:
+                print(f"[{self.feed_name} Depth connection error: {e}. Reconnecting in {self._reconnect_delay_seconds}s...")
+                await asyncio.sleep(self._reconnect_delay_seconds)
+                self._reconnect_delay_seconds = min(self._reconnect_delay_seconds * 2, self._max_reconnect_delay)
 
     async def _connect_trade(self):
         while True:
-            # try:
+            try:
                 async with websockets.connect(self._trade_url) as ws:
+                    self.connected = True
+                    self._reconnect_delay_seconds = 1  # reset on successful connect
                     async for msg in ws:
-                        data = json.loads(msg)
-                        if self.last_trade_time <= data['E']: # milliseconds since epoch
-                            self.last_trade_time = data['E']
-                            price = float(data['p'])
-                            size = float(data['q'])
-                            side = 'bid' if data['m'] is False else 'ask'  # 'm' = maker side (True if sell)
-                            if size > EPSILON:
-                                trade = BookLevel(price=price, size=size, exchange=self.feed_name)
-                                await self._notify_trade(trade)
-                        else:
-                            print(f"[{self.feed_name}] Warning: received out-of-order trade update (timestamp {data['E']} < last {self.last_trade_time}). Ignoring.")
-            # except Exception as e:
-            #     print(f"[BinanceFeed] Trade connection error: {e}. Reconnecting in {self._reconnect_delay_seconds}s...")
-            #     await asyncio.sleep(self._reconnect_delay_seconds)
-            #     self._reconnect_delay_seconds = min(self._reconnect_delay_seconds * 2, self._max_reconnect_delay)
+                        await self._listen_trade(msg)
+            except Exception as e:
+                self.connected = False
+                print(f"[{self.feed_name}] Connection error: {e}. Reconnecting in {self._reconnect_delay_seconds}s...")
+                await asyncio.sleep(self._reconnect_delay_seconds)
+                self._reconnect_delay_seconds = min(
+                    self._reconnect_delay_seconds * 2,
+                    self._max_reconnect_delay
+                )
+
+    # ----------------- Trade Stream Handling -----------------
+    async def _listen_trade(self, msg):
+        try:
+            data = json.loads(msg)
+            timestamp = data['E']  # milliseconds since epoch
+            if timestamp < self.last_trade_time:
+                print(f"[{self.feed_name}] Out-of-order trade ignored (ts {timestamp} < last {self.last_trade_time})")
+                return
+            self.last_trade_time = timestamp
+            price = float(data['p'])
+            size = float(data['q'])
+            if size <= EPSILON:
+                return
+            trade = Trade(
+                exchange=self.feed_name,
+                price=price,
+                size=size,
+                timestamp=timestamp
+            )
+            await self._notify_trade(trade)
+        except Exception as e:
+            print(f"[{self.feed_name}] Trade processing error: {e}")
+            pdb.post_mortem(sys.exc_info()[2])
 
     # ----------------- Depth Stream Handling -----------------
     async def _listen_depth(self, ws):
-        async for msg in ws:
-            data = json.loads(msg)
-            if self.last_update_time <= data['E']: # milliseconds since epoch
-                self.last_update_time = data['E']
-                changes = []
-                for price_str, qty_str in data.get('b', []):
-                    changes.append(('buy', price_str, qty_str))
-                for price_str, qty_str in data.get('a', []):
-                    changes.append(('sell', price_str, qty_str))
+        try:
+            async for msg in ws:
+                data = json.loads(msg)
+                if self.last_update_time <= data['E']: # milliseconds since epoch
+                    self.last_update_time = data['E']
+                    changes = []
+                    for price_str, qty_str in data.get('b', []):
+                        changes.append(('buy', price_str, qty_str, self.last_update_time))
+                    for price_str, qty_str in data.get('a', []):
+                        changes.append(('sell', price_str, qty_str, self.last_update_time))
 
-                await self._process_l2update_fast(changes)
-            else:
-                print(f"[{self.feed_name}] Warning: received out-of-order depth update (timestamp {data['E']} < last {self.last_update_time}). Ignoring.")
+                    await self._process_l2update_fast(changes)
+                else:
+                    print(f"[{self.feed_name}] Warning: received out-of-order depth update (timestamp {data['E']} < last {self.last_update_time}). Ignoring.")
+        except Exception as e:
+            print(f"[{self.feed_name}] Depth processing error: {e}")
+            pdb.post_mortem(sys.exc_info()[2])
 
     # ----------------- Fast-Path Top-N -----------------
-    async def _process_l2update_fast(self, changes):
+    async def _process_l2update_fast(self, changes: list[tuple[str, str, str, float]]):
         top_updated = False
 
-        # Phase 1: update top-N first
-        for side_str, price_str, size_str in changes:
+        for side_str, price_str, size_str, dt in changes:
             price = float(price_str)
             size = float(size_str)
             side = 'bid' if side_str == 'buy' else 'ask'
@@ -94,7 +120,7 @@ class BinanceFeed(FeedBase):
                (side == 'bid' and price > min(top_prices)) or \
                (side == 'ask' and price < max(top_prices)):
                 old_top = self.book.get_top(side).copy()
-                self.book.update_level(side, price, size, self.feed_name)
+                self.book.update_level(side, price, size, self.feed_name, dt)
                 if self.book.get_top(side) != old_top:
                     top_updated = True
 
@@ -108,8 +134,8 @@ class BinanceFeed(FeedBase):
             await self._notify_book()
 
         # Phase 2: full book async
-        for side_str, price_str, size_str in changes:
+        for side_str, price_str, size_str, ts in changes:
             price = float(price_str)
             size = float(size_str)
             side = 'bid' if side_str == 'buy' else 'ask'
-            self._full_book_queue.put_nowait((side, price, size))
+            self._full_book_queue.put_nowait((side, price, size, ts))

@@ -4,7 +4,13 @@ Author: Benjamin Noirat
 Date: 2026-04-02
 """
 from cmath import isclose
+import json
 from core.constants import EPSILON, CONTRACT_SPECS
+from core.types import Order
+from core.order_book import FeedOrderBook
+import math
+import time
+import math
 
 class StratBen:
     def __init__(self, params):
@@ -13,8 +19,8 @@ class StratBen:
         for feed in params['feeds']:
             feed.subscribe_book(self.on_book_update)
             feed.subscribe_trade(self.on_trade_update)
-        self.position = 0.0
-        self.active_orders = {}
+        self.position: float = 0.0
+        self.active_orders: dict[str, list[Order]] = {}
 
     async def on_book_update(self, feed_name: str, book):
         if self.params['prints']['data_updates']:
@@ -27,21 +33,47 @@ class StratBen:
         
 
         # update indicators, in this exercise it is just the fair value
-        fair_value = self.calc_global_fair_value()
+        fair_value: float = self.calc_global_fair_value()
 
         # produce orders from the fair value, the position management, the risk limits
-        orders = self.calc_quotes(fair_value)
+        orders: dict[str, list[Order]] = self.calc_quotes(fair_value)
 
         # send out orders to markets
         self.send_orders(orders)
 
-    def send_orders(self, orders_dict):
+    def send_orders(self, orders_dict: dict[str, list[Order]]):
         # not implemented, as per assignment
+        # here we just assume orders become active immediately, if there was a similar active order, we do not replace it (and thus keep its original timestamp)
+        for feed_name, orders in orders_dict.items():
+            for i, new_order in enumerate(orders):
+                if feed_name in self.active_orders:
+                    for active_order in self.active_orders[feed_name]:
+                        if active_order.side == new_order.side and active_order.price == new_order.price and active_order.size == new_order.size:
+                            orders[i] = active_order
+        if self.params['prints']['orders']:
+            for feed in self.params['feeds']:
+                active_orders = self.active_orders[feed.feed_name] if feed.feed_name in self.active_orders else []
+                new_orders = orders_dict[feed.feed_name]
+                for active_order in active_orders:
+                    if not any(all(getattr(active_order, attr) == getattr(new_order, attr) for attr in vars(active_order)) for new_order in new_orders):
+                        print(f"Cancel {active_order} on {feed.feed_name}")
+                for new_order in new_orders:
+                    if not any(all(getattr(active_order, attr) == getattr(new_order, attr) for attr in vars(active_order)) for active_order in active_orders):
+                        print(f"Send {new_order} on {feed.feed_name}")
         self.active_orders = orders_dict
 
     async def on_trade_update(self, feed_name: str, trade):
+        # TODO: this can be used to improve prediction or fair value
         if self.params['prints']['data_updates']:
             print(f"{feed_name} trade: {trade.size}@{trade.price}")
+
+    async def load_position(self):
+        try:
+            with open(self.params['position_file'], 'r') as f:
+                data = json.load(f)
+            self.position = data.get("position", self.position)
+        except Exception as e:
+            print(f"[red]Error reading position file:[/red] {e}")
 
     def calc_global_fair_value(self):
         # aggregate books
@@ -53,10 +85,10 @@ class StratBen:
                 bids.extend(feed.book.get_top('bid').values())  # list of BookLevel
                 asks.extend(feed.book.get_top('ask').values())
 
-            bids = sorted(bids, key=lambda x: x.price, reverse=True)[:nb_levels]
-            asks = sorted(asks, key=lambda x: x.price)[:nb_levels]
-            return {'bids': bids, 'asks': asks}
-        
+            bids_sorted = sorted(bids, key=lambda x: x.price, reverse=True)[:nb_levels]
+            asks_sorted = sorted(asks, key=lambda x: x.price)[:nb_levels]
+            return {'bids': bids_sorted, 'asks': asks_sorted}
+
         # calculate the VWAP of the consolidated top-N levels, weighted by inverse distance to mid, more robust to changes deeeper in the book
         def inv_distance_weighted_vwap(bids, asks):
             vwap_bids = (
@@ -75,12 +107,17 @@ class StratBen:
                 weighted_sum = 0.0
                 weight_total = 0.0
                 for lvl in levels:
-                    distance = abs(lvl.price - ref_px)
-                    if isclose(distance, 0.0):
-                        distance = EPSILON  # prevent divide by zero, although it should not happen if we uncrossed correcctly
-                    weight       = lvl.size / distance
-                    weighted_sum += lvl.price * weight
-                    weight_total += weight
+                    feed     = next((f for f in self.params['feeds'] if f.feed_name == lvl.exchange), None)
+                    distance = max(abs(lvl.price - ref_px), EPSILON)
+                    age_secs = time.time() - lvl.last_update / 1000
+
+                    weight_distance = lvl.size / distance
+                    weight_status   = 1.0 if feed.connected else 0.0
+                    weight_freshness = math.exp(-math.log(2) * age_secs / self.params['fair_value']['quote_half_life_seconds'])
+                    weight = weight_distance * weight_status * weight_freshness
+                    
+                    weighted_sum    += lvl.price * weight
+                    weight_total    += weight
                 return weighted_sum / weight_total if weight_total > 0 else None
             bid_vwap = get_inv_distance_weighted_vwap(bids, vwap_asks) if vwap_asks is not None else None
             ask_vwap = get_inv_distance_weighted_vwap(asks, vwap_bids) if vwap_bids is not None else None
@@ -98,8 +135,8 @@ class StratBen:
             else:
                 all_bids = consolidated_book['bids']
                 all_asks = consolidated_book['asks']
+            # TODO: we might want to ignore our own active orders in the fair value calculation
 
-            # calc fair value as average of bid and ask weighted VWAPs
             bid_vwap, ask_vwap   = inv_distance_weighted_vwap(all_bids, all_asks)
             fair_value = (bid_vwap + ask_vwap) / 2 if bid_vwap is not None and ask_vwap is not None else None
         else:
@@ -107,39 +144,88 @@ class StratBen:
 
         return fair_value
     
-    def calc_quotes(self, fair_value):
-        def apply_spread(fair_value):
+    def calc_quotes(self, fair_value) -> dict[str, list[Order]]:
+        def apply_spread(fair_value) -> tuple[float, float, float, float]:
             half_spread = self.params['quotes']['spread_fixed'] / 2
-            size_bid    = min(self.params['quotes']['size'], self.params['risk_limits']['max_position'] - self.position)
-            size_ask    = min(self.params['quotes']['size'], self.params['risk_limits']['max_position'] + self.position)
             bid_price   = fair_value - half_spread
             ask_price   = fair_value + half_spread
-            return bid_price, ask_price, size_bid, size_ask
+            return bid_price, ask_price
         
-        def apply_position_spread(bid_price, ask_price):
+        def apply_position_spread(bid_price, ask_price) -> tuple[float, float]:
             pos_skew  = (
                 0.0 if self.params['risk_limits']['max_position'] == 0 else
-                    self.position / self.params['risk_limits']['max_position'] * self.params['quotes']['spread_max_pos']
+                    -self.position / self.params['risk_limits']['max_position'] * self.params['quotes']['spread_max_pos']
             )
-            bid_price = max(bid_price - pos_skew, 0.0)
-            ask_price = max(ask_price + pos_skew, 0.0)
+            bid_price_pos = max(bid_price + pos_skew, 0.0)
+            ask_price_pos = max(ask_price + pos_skew, 0.0)
+            return bid_price_pos, ask_price_pos
+        
+        def avoid_large_whales(bid_price, ask_price) -> tuple[float, float]:
             return bid_price, ask_price
+
+        def apply_sizing(ob: FeedOrderBook) -> tuple[float, float]:
+            # this part could be written in a more efficient way, but this way is preferred for now as more readable
+
+            def round_10pct(x: float) -> float:
+                if x == 0:
+                    return 0
+                magnitude = 10 ** math.floor(math.log10(abs(x)))
+                rounded = round(x / magnitude, 1) * magnitude
+                return rounded
+
+            # base size from config
+            size_bid    = self.params['quotes']['size']
+            size_ask    = self.params['quotes']['size']
+
+            # adjust according to market siZe to avoid pushing the market. 
+            # I decided to use both bid and ask, it could be that using a specific side works better
+            vol_bid     = sum([lvl.size for _, lvl in ob.bids_top.items()])
+            vol_ask     = sum([lvl.size for _, lvl in ob.asks_top.items()])
+            vol_top_lvl = (vol_bid + vol_ask) / 2.0
+            size_bid    = min(size_bid, vol_top_lvl * self.params['quotes']['max_share_mkt'])
+            size_ask    = min(size_ask, vol_top_lvl * self.params['quotes']['max_share_mkt'])
+            # round sizes to avoid re ordering constanlty
+            size_bid = round_10pct(size_bid)
+            size_ask = round_10pct(size_ask)
+
+            # do not try to exceed max position limits
+            size_bid    = min(size_bid, self.params['risk_limits']['max_position'] - self.position)
+            size_ask    = min(size_ask, self.params['risk_limits']['max_position'] + self.position)
+
+            # sanity check, no negative sizes
+            size_bid    = max(0.0, size_bid)
+            size_ask    = max(0.0, size_ask)
+            return size_bid, size_ask
 
         if fair_value is None:
             return {}
         else:
-            bid_price, ask_price, size_bid, size_ask = apply_spread(fair_value)
+            bid_price, ask_price = apply_spread(fair_value)
             bid_price, ask_price = apply_position_spread(bid_price, ask_price)
+            bid_price, ask_price = avoid_large_whales(bid_price, ask_price)
+            timestamp = time.time() * 1000 # milliseconds since epoch
 
             orders_dict = {}
             for feed in self.params['feeds']:
                 # adapt quoting logic to each feed
                 tick_size = CONTRACT_SPECS[self.params['symbol']][feed.feed_name]["tick_size"]
-                bid_price = min(bid_price, feed.book.get_best_bid()[0] + tick_size * 1) if feed.book.get_best_bid() else bid_price
-                ask_price = max(ask_price, feed.book.get_best_ask()[0] - tick_size * 1) if feed.book.get_best_ask() else ask_price
 
-                orders_dict[feed.feed_name] = [
-                        {'side': 'bid', 'price': bid_price, 'size': size_bid},
-                        {'side': 'ask', 'price': ask_price, 'size': size_ask}
-                    ]
+                # sizing
+                size_bid, size_ask   = apply_sizing(feed.book)
+                
+                # dime the best quotee on our side
+                bid_price = min(bid_price, feed.book.get_best_bid().price + tick_size * 1) if feed.book.get_best_bid() else bid_price
+                ask_price = max(ask_price, feed.book.get_best_ask().price - tick_size * 1) if feed.book.get_best_ask() else ask_price
+                
+                # now explicitely forbid crossing the spread if diming were to make us aggreessivelly taking the other side
+                bid_price = min(bid_price, feed.book.get_best_ask().price - tick_size * 1) if feed.book.get_best_ask() else bid_price
+                ask_price = max(ask_price, feed.book.get_best_bid().price + tick_size * 1) if feed.book.get_best_bid() else ask_price
+
+                orders_dict[feed.feed_name] = []
+                if size_bid > EPSILON:
+                    order = Order(feed.feed_name, 'bid', bid_price, size_bid, timestamp)
+                    orders_dict[feed.feed_name].append(order)
+                if size_ask > EPSILON:
+                    order = Order(feed.feed_name, 'ask', ask_price, size_ask, timestamp)
+                    orders_dict[feed.feed_name].append(order)
             return orders_dict

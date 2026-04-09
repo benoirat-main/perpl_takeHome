@@ -18,9 +18,12 @@ class Order:
     side     : str  # 'buy' or 'sell'
     price    : float
     size     : float
+    ts_sent  : float
 
 @dataclass
 class BookLevel:
-    price    : float
-    size     : float
-    exchange : str # if we want to create a consolidated book, we will need this info    
+    side        : str  # 'buy' or 'sell'
+    price       : float
+    size        : float
+    exchange    : str # if we want to create a consolidated book, we will need this info
+    last_update : float 

@@ -7,10 +7,12 @@ Top-N fast-path updates first, full book async after
 
 import asyncio
 import json
+import pdb
+import sys
 import websockets
 
 from core.constants import EPSILON, CONTRACT_SPECS
-from core.types import BookLevel
+from core.types import Trade
 from core.order_book import TOP_N
 from feeds.feedbase import FeedBase
 from datetime import datetime
@@ -25,15 +27,16 @@ class CoinbaseFeed(FeedBase):
     # ----------------- WebSocket Connection -----------------
     async def connect(self):
         while True:
-            # try:
+            try:
                 async with websockets.connect(self.ws_url, max_size=None) as ws:
                     await self._subscribe(ws)
+                    self.connected = True
                     self._reconnect_delay_seconds = 1
                     await self._listen(ws)
-            # except Exception as e:
-            #     print(f"[CoinbaseFeed] Connection error: {e}. Reconnecting in {self._reconnect_delay_seconds}s...")
-            #     await asyncio.sleep(self._reconnect_delay_seconds)
-            #     self._reconnect_delay_seconds = min(self._reconnect_delay_seconds * 2, self._max_reconnect_delay)
+            except Exception as e:
+                print(f"[CoinbaseFeed] Connection error: {e}. Reconnecting in {self._reconnect_delay_seconds}s...")
+                await asyncio.sleep(self._reconnect_delay_seconds)
+                self._reconnect_delay_seconds = min(self._reconnect_delay_seconds * 2, self._max_reconnect_delay)
 
     async def _subscribe(self, ws):
         msg = {
@@ -45,46 +48,45 @@ class CoinbaseFeed(FeedBase):
         print(f"[CoinbaseFeed] Subscribed to {self.symbol} channels.")
 
     async def _listen(self, ws):
-        async for msg in ws:
-            data = json.loads(msg)
-            msg_type = data.get("type")
+        try:
+            async for msg in ws:
+                data     = json.loads(msg)
+                msg_type = data.get("type")
+                msg_ts   = data.get("time")
+                dt       = datetime.fromisoformat(msg_ts.replace("Z", "+00:00")).timestamp() * 1000 if msg_ts else 0.0
 
-            if msg_type == "snapshot":
-                # Initialize full book
-                for side in ['bids', 'asks']:
-                    for price_str, size_str in data[side]:
-                        price = float(price_str)
-                        size = float(size_str)
-                        self.book.update_level(side[:-1], price, size, self.feed_name)
-                # Notify top-N fast path
-                await self._notify_book()
-
-            elif msg_type == "l2update":
-                dt_str = data.get("time")
-                dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00")).timestamp() * 1000 # Convert to milliseconds since epoch
                 if dt >= self.last_update_time:
-                    self.last_update_time = dt
-                    changes = data.get("changes", [])
-                    await self._process_l2update_fast(changes)
-                else:
-                    print(f"[{self.feed_name}] Warning: received out-of-order l2 update (timestamp {dt} < last {self.last_update_time}). Ignoring.")
-
-            elif msg_type == "match":
-                dt_str = data.get("time")
-                dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00")).timestamp() * 1000 # Convert to milliseconds since epoch
-                if dt >= self.last_trade_time:
-                    self.last_trade_time = dt                  
-                    price = float(data['price'])
-                    size = float(data['size'])
-                    if size > EPSILON:
-                        trade = BookLevel(price=price, size=size, exchange=self.feed_name)
-                        await self._notify_trade(trade)
+                    if msg_type == "snapshot":
+                        for side in ['bids', 'asks']:
+                            for price_str, size_str in data[side]:
+                                price = float(price_str)
+                                size = float(size_str)
+                                self.book.update_level(side[:-1], price, size, self.feed_name, dt)
+                        await self._notify_book()
+                    elif msg_type == "l2update":
+                        dt_str = data.get("time")
+                        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00")).timestamp() * 1000 # Convert to milliseconds since epoch
+                        self.last_update_time = dt
+                        changes = data.get("changes", [])
+                        await self._process_l2update_fast(changes, dt)
+                    elif msg_type == "match":
+                        dt_str = data.get("time")
+                        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00")).timestamp() * 1000 # Convert to milliseconds since epoch
+                        if dt >= self.last_trade_time:
+                            self.last_trade_time = dt                  
+                            price = float(data['price'])
+                            size = float(data['size'])
+                            if size > EPSILON:
+                                trade = Trade(price=price, size=size, exchange=self.feed_name, timestamp=dt)
+                                await self._notify_trade(trade)
                 else:
                     print(f"[{self.feed_name}] Warning: received out-of-order trade update (timestamp {dt} < last {self.last_trade_time}). Ignoring.")
-
+        except Exception as e:
+            print(f"[{self.feed_name}] Error processing message: {e}")
+            pdb.post_mortem(sys.exc_info()[2])
 
     # ----------------- Fast-Path Top-N -----------------
-    async def _process_l2update_fast(self, changes):
+    async def _process_l2update_fast(self, changes, dt):
         """Process level2_batch changes in two phases: top-N first, full book async later"""
         top_updated = False
 
@@ -100,7 +102,7 @@ class CoinbaseFeed(FeedBase):
                (side == 'bid' and price > min(top_prices)) or \
                (side == 'ask' and price < max(top_prices)):
                 old_top = self.book.get_top(side).copy()
-                self.book.update_level(side, price, size, self.feed_name)
+                self.book.update_level(side, price, size, self.feed_name, dt)
                 if self.book.get_top(side) != old_top:
                     top_updated = True
 
@@ -120,4 +122,4 @@ class CoinbaseFeed(FeedBase):
             size = float(size_str)
             side = 'bid' if side_str == 'buy' else 'ask'
             # Push all changes to the queue for background processing
-            self._full_book_queue.put_nowait((side, price, size))
+            self._full_book_queue.put_nowait((side, price, size, dt))
