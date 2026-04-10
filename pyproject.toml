@@ -1,0 +1,12 @@
+[project]
+name = "perpl_takehome"
+version = "0.1.0"
+dependencies = [
+    "websockets",
+    "rich",
+    "pytest",
+    "pytest-asyncio"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
