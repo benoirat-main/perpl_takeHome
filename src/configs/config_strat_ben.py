@@ -4,6 +4,7 @@ Date: 2026-04-10
 """
 
 from collections import defaultdict
+from pathlib import Path
 
 def get_params():
     params = defaultdict(dict)
@@ -16,7 +17,7 @@ def get_params():
     }
     params['debug'] = True
     params['symbol'] = 'BTCUSD'
-    params['position_file'] = "src/position.json" # file to modify position, as per assignment
+    params['position_file'] = Path("src") / "position.json" # file to modify position, as per assignment
     # the following are given in price, it could also be in % of mid price etc
     params['fair_value'] = {
         'uncross_consolidated_book' : False, # whether to filter out crossed levels in the consolidated book before calculating fair value. This looses a lot if info when exchanges are far apart

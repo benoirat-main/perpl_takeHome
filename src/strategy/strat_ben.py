@@ -171,7 +171,7 @@ class StratBen:
             size_bid    = self.params['quotes']['size']
             size_ask    = self.params['quotes']['size']
 
-            # adjust according to market siZe to avoid pushing the market. 
+            # adjust according to market size to avoid pushing the market. 
             # I decided to use both bid and ask, it could be that using a specific side works better
             vol_bid     = sum([lvl.size for _, lvl in ob.bids_top.items()])
             vol_ask     = sum([lvl.size for _, lvl in ob.asks_top.items()])

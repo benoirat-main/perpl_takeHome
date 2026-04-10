@@ -2,6 +2,8 @@
 
 ## Setup
 
+# Note, this was set up on a ubuntu distribution, I have not tested it under windows
+
 ```bash
 git clone <repo>
 cd <repo>
@@ -44,6 +46,7 @@ This project implements a real-time trading system that:
     - Quote sizing 
       - Proportion of volumes seen on the top 20 levels, buffered to avoid replacing quotes too often
       - Last check vs position and max position parameter to avoid busting risk limits
+  - Strategy tracks position from file position.json, you can simply modify this file and save and quotes will be adjusted accordingly
 
 * Provides a CLI monitoring interface
   - per feed, shows the top 20 levels with age of each quote, as well as age per feed
