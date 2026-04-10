@@ -3,7 +3,6 @@
 Author: Benjamin Noirat 
 Date: 2026-04-02
 """
-from cmath import isclose
 import json
 from core.constants import EPSILON, CONTRACT_SPECS
 from core.types import Order
@@ -11,6 +10,7 @@ from core.order_book import FeedOrderBook
 import math
 import time
 import math
+import core.utils
 
 class StratBen:
     def __init__(self, params):
@@ -29,8 +29,7 @@ class StratBen:
             mid = book.get_mid()
             print(f"{feed_name} book: bid {best_bid}, ask {best_ask}, mid {mid}")
 
-        # data sanity checks: mostly already implemented at the feed level
-        
+        # data sanity checks: already implemented at the feed level
 
         # update indicators, in this exercise it is just the fair value
         fair_value: float = self.calc_global_fair_value()
@@ -75,6 +74,39 @@ class StratBen:
         except Exception as e:
             print(f"[red]Error reading position file:[/red] {e}")
 
+    def inv_distance_weighted_vwap(self, bids, asks):
+        vwap_bids = (
+            (sum(b.price * b.size for b in bids) / total) 
+            if (total := sum(b.size for b in bids)) > 0 
+            else None
+        )
+        vwap_asks = (
+            (sum(a.price * a.size for a in asks) / total) 
+            if (total := sum(a.size for a in asks)) > 0 
+            else None
+        )
+
+        # now weigh each level, giving less weight to the ones further away. I use opposite VWAP as a ref price as using mid would put too much weight on the first level
+        def get_inv_distance_weighted_vwap(levels, ref_px):
+            weighted_sum = 0.0
+            weight_total = 0.0
+            for lvl in levels:
+                feed     = next((f for f in self.params['feeds'] if f.feed_name == lvl.exchange), None)
+                distance = max(abs(lvl.price - ref_px), EPSILON)
+                age_secs = time.time() - lvl.last_update / 1000
+
+                weight_distance = lvl.size / distance
+                weight_status   = 1.0 if feed.connected else 0.0
+                weight_freshness = math.exp(-math.log(2) * age_secs / self.params['fair_value']['quote_half_life_seconds'])
+                weight = weight_distance * weight_status * weight_freshness
+                
+                weighted_sum    += lvl.price * weight
+                weight_total    += weight
+            return weighted_sum / weight_total if weight_total > 0 else None
+        bid_vwap = get_inv_distance_weighted_vwap(bids, vwap_asks) if vwap_asks is not None else None
+        ask_vwap = get_inv_distance_weighted_vwap(asks, vwap_bids) if vwap_bids is not None else None
+        return bid_vwap, ask_vwap
+
     def calc_global_fair_value(self):
         # aggregate books
         def consolidated_top_levels(nb_levels : int):
@@ -90,38 +122,6 @@ class StratBen:
             return {'bids': bids_sorted, 'asks': asks_sorted}
 
         # calculate the VWAP of the consolidated top-N levels, weighted by inverse distance to mid, more robust to changes deeeper in the book
-        def inv_distance_weighted_vwap(bids, asks):
-            vwap_bids = (
-                (sum(b.price * b.size for b in bids) / total) 
-                if (total := sum(b.size for b in bids)) > 0 
-                else None
-            )
-            vwap_asks = (
-                (sum(a.price * a.size for a in asks) / total) 
-                if (total := sum(a.size for a in asks)) > 0 
-                else None
-            )
-
-            # now weigh eeach level, giving less weight to the ones further away. I use opposite VWAP as a ref price as using mid would put too much weight on the first level
-            def get_inv_distance_weighted_vwap(levels, ref_px):
-                weighted_sum = 0.0
-                weight_total = 0.0
-                for lvl in levels:
-                    feed     = next((f for f in self.params['feeds'] if f.feed_name == lvl.exchange), None)
-                    distance = max(abs(lvl.price - ref_px), EPSILON)
-                    age_secs = time.time() - lvl.last_update / 1000
-
-                    weight_distance = lvl.size / distance
-                    weight_status   = 1.0 if feed.connected else 0.0
-                    weight_freshness = math.exp(-math.log(2) * age_secs / self.params['fair_value']['quote_half_life_seconds'])
-                    weight = weight_distance * weight_status * weight_freshness
-                    
-                    weighted_sum    += lvl.price * weight
-                    weight_total    += weight
-                return weighted_sum / weight_total if weight_total > 0 else None
-            bid_vwap = get_inv_distance_weighted_vwap(bids, vwap_asks) if vwap_asks is not None else None
-            ask_vwap = get_inv_distance_weighted_vwap(asks, vwap_bids) if vwap_bids is not None else None
-            return bid_vwap, ask_vwap
 
         consolidated_book = consolidated_top_levels(self.params['fair_value']['top_n'])
 
@@ -137,7 +137,7 @@ class StratBen:
                 all_asks = consolidated_book['asks']
             # TODO: we might want to ignore our own active orders in the fair value calculation
 
-            bid_vwap, ask_vwap   = inv_distance_weighted_vwap(all_bids, all_asks)
+            bid_vwap, ask_vwap   = self.inv_distance_weighted_vwap(all_bids, all_asks)
             fair_value = (bid_vwap + ask_vwap) / 2 if bid_vwap is not None and ask_vwap is not None else None
         else:
             fair_value = None
@@ -161,17 +161,11 @@ class StratBen:
             return bid_price_pos, ask_price_pos
         
         def avoid_large_whales(bid_price, ask_price) -> tuple[float, float]:
+            # TODOL possiblee extension to avoid placing our order just behing a very large order, prefeer placing just in front
             return bid_price, ask_price
 
         def apply_sizing(ob: FeedOrderBook) -> tuple[float, float]:
             # this part could be written in a more efficient way, but this way is preferred for now as more readable
-
-            def round_10pct(x: float) -> float:
-                if x == 0:
-                    return 0
-                magnitude = 10 ** math.floor(math.log10(abs(x)))
-                rounded = round(x / magnitude, 1) * magnitude
-                return rounded
 
             # base size from config
             size_bid    = self.params['quotes']['size']
@@ -185,8 +179,8 @@ class StratBen:
             size_bid    = min(size_bid, vol_top_lvl * self.params['quotes']['max_share_mkt'])
             size_ask    = min(size_ask, vol_top_lvl * self.params['quotes']['max_share_mkt'])
             # round sizes to avoid re ordering constanlty
-            size_bid = round_10pct(size_bid)
-            size_ask = round_10pct(size_ask)
+            size_bid = core.utils.round_10pct(size_bid)
+            size_ask = core.utils.round_10pct(size_ask)
 
             # do not try to exceed max position limits
             size_bid    = min(size_bid, self.params['risk_limits']['max_position'] - self.position)

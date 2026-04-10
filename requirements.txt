@@ -1,1 +1,4 @@
+rich
 websockets
+pytest-asyncio
+pytest

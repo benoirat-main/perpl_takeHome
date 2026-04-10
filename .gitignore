@@ -3,6 +3,9 @@ __pycache__/
 *.pyc
 mainTest.py
 
+# others
+perpl_takehome.egg-info
+
 # Virtual env
 venv/
 .env

@@ -7,7 +7,6 @@ Binance feed with top-N fast-path, async full-book, and trade notifications
 
 import asyncio
 import json
-import pdb
 import sys
 import websockets
 
@@ -84,7 +83,6 @@ class BinanceFeed(FeedBase):
             await self._notify_trade(trade)
         except Exception as e:
             print(f"[{self.feed_name}] Trade processing error: {e}")
-            pdb.post_mortem(sys.exc_info()[2])
 
     # ----------------- Depth Stream Handling -----------------
     async def _listen_depth(self, ws):
@@ -104,7 +102,6 @@ class BinanceFeed(FeedBase):
                     print(f"[{self.feed_name}] Warning: received out-of-order depth update (timestamp {data['E']} < last {self.last_update_time}). Ignoring.")
         except Exception as e:
             print(f"[{self.feed_name}] Depth processing error: {e}")
-            pdb.post_mortem(sys.exc_info()[2])
 
     # ----------------- Fast-Path Top-N -----------------
     async def _process_l2update_fast(self, changes: list[tuple[str, str, str, float]]):

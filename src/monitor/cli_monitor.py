@@ -1,3 +1,8 @@
+"""
+Author: Benjamin Noirat 
+Date: 2026-04-06
+"""
+
 import asyncio
 from rich.live import Live
 from rich.table import Table

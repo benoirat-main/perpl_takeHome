@@ -1,13 +1,11 @@
 """
 Author: Benjamin Noirat
 Date: 2026-04-02
-Updated: 2026-04-02
 Top-N fast-path updates first, full book async after
 """
 
 import asyncio
 import json
-import pdb
 import sys
 import websockets
 
@@ -83,7 +81,6 @@ class CoinbaseFeed(FeedBase):
                     print(f"[{self.feed_name}] Warning: received out-of-order trade update (timestamp {dt} < last {self.last_trade_time}). Ignoring.")
         except Exception as e:
             print(f"[{self.feed_name}] Error processing message: {e}")
-            pdb.post_mortem(sys.exc_info()[2])
 
     # ----------------- Fast-Path Top-N -----------------
     async def _process_l2update_fast(self, changes, dt):
