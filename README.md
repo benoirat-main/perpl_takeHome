@@ -1,4 +1,4 @@
-# Perpl Take-Home – Async Multi-Feed Trading System
+# Take-Home assignment – Simplified Async Multi-Feed Trading System
 
 ## Setup
 
